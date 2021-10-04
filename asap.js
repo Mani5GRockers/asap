@@ -1,114 +1,44 @@
 "use strict";
-
-// Use the fastest possible means to execute a task in a future turn
-// of the event loop.
-
-// linked list of tasks (single, with head node)
-var head = {task: void 0, next: null};
-var tail = head;
-var flushing = false;
-var requestFlush = void 0;
-var hasSetImmediate = typeof setImmediate === "function";
-var domain;
-
-// Avoid shims from browserify.
-// The existence of `global` in browsers is guaranteed by browserify.
-var process = global.process;
-
-// Note that some fake-Node environments,
-// like the Mocha test runner, introduce a `process` global.
-var isNodeJS = !!process && ({}).toString.call(process) === "[object process]";
-
-function flush() {
-    /* jshint loopfunc: true */
-
-    while (head.next) {
-        head = head.next;
-        var task = head.task;
-        head.task = void 0;
-
-        try {
-            task.call();
-
-        } catch (e) {
-            if (isNodeJS) {
-                // In node, uncaught exceptions are considered fatal errors.
-                // Re-throw them to interrupt flushing!
-
-                // Ensure continuation if an uncaught exception is suppressed
-                // listening process.on("uncaughtException") or domain("error").
-                requestFlush();
-
-                throw e;
-
-            } else {
-                // In browsers, uncaught exceptions are not fatal.
-                // Re-throw them asynchronously to avoid slow-downs.
-                setTimeout(function () {
-                    throw e;
-                }, 0);
-            }
-        }
     }
-
-    flushing = false;
+    rawTask.task = task;
+    rawTask.domain = process.domain;
+    rawAsap(rawTask);
 }
 
-if (isNodeJS) {
-    // Node.js
-    requestFlush = function () {
-        // Ensure flushing is not bound to any domain.
-        var currentDomain = process.domain;
-        if (currentDomain) {
-            domain = domain || (1,require)("domain");
-            domain.active = process.domain = null;
-        }
-
-        // Avoid tick recursion - use setImmediate if it exists.
-        if (flushing && hasSetImmediate) {
-            setImmediate(flush);
-        } else {
-            process.nextTick(flush);
-        }
-
-        if (currentDomain) {
-            domain.active = process.domain = currentDomain;
-        }
-    };
-
-} else if (hasSetImmediate) {
-    // In IE10, or https://github.com/NobleJS/setImmediate
-    requestFlush = function () {
-        setImmediate(flush);
-    };
-
-} else if (typeof MessageChannel !== "undefined") {
-    // modern browsers
-    // http://www.nonblocking.io/2011/06/windownexttick.html
-    var channel = new MessageChannel();
-    channel.port1.onmessage = flush;
-    requestFlush = function () {
-        channel.port2.postMessage(0);
-    };
-
-} else {
-    // old browsers
-    requestFlush = function () {
-        setTimeout(flush, 0);
-    };
+function RawTask() {
+    this.task = null;
+    this.domain = null;
 }
 
-function asap(task) {
-    if (isNodeJS && process.domain) {
-        task = process.domain.bind(task);
+RawTask.prototype.call = function () {
+    if (this.domain) {
+        this.domain.enter();
     }
-
-    tail = tail.next = {task: task, next: null};
-
-    if (!flushing) {
-        requestFlush();
-        flushing = true;
+    var threw = true;
+    try {
+        this.task.call();
+        threw = false;
+        // If the task throws an exception (presumably) Node.js restores the
+        // domain stack for the next event.
+        if (this.domain) {
+            this.domain.exit();
+        }
+    } finally {
+        // We use try/finally and a threw flag to avoid messing up stack traces
+        // when we catch and release errors.
+        if (threw) {
+            // In Node.js, uncaught exceptions are considered fatal errors.
+            // Re-throw them to interrupt flushing!
+            // Ensure that flushing continues if an uncaught exception is
+            // suppressed listening process.on("uncaughtException") or
+            // domain.on("error").
+            rawAsap.requestFlush();
+        }
+        // If the task threw an error, we do not want to exit the domain here.
+        // Exiting the domain would prevent the domain from catching the error.
+        this.task = null;
+        this.domain = null;
+        freeTasks.push(this);
     }
 };
 
-module.exports = asap;
